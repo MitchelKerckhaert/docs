@@ -1,0 +1,458 @@
+---
+title: "Azure App Configuration"
+description: "Azure App Configuration allows you to store your application settings seperately from you sourcecode and pull them in wherever you need them."
+icon: "sliders"
+iconType: "duotone"
+---
+
+## Azure App Configuration at Scale — Settings, Feature Flags, Snapshots, and Env‑per‑Store Workflow (Mintlify + React)
+
+> A comprehensive, opinionated guide for building a robust, multi‑environment configuration platform on Azure App Configuration—with settings, feature flags, immutable snapshots, and a separate App Configuration store per environment workflow. Built to drop into your Mintlify docs (MDX + React).
+
+This guide assumes you’re comfortable with Azure CLI and at least one runtime (.NET, Node.js, or Python). We’ll show canonical patterns, plus production‑grade tips: RBAC, private endpoints, refresh strategies, and promotion pipelines.
+
+### Why Azure App Configuration?
+
+Azure App Configuration centralizes **key‑value settings** and **feature flags**, supports dynamic refresh in applications, and adds **snapshots** for safe, auditable releases. It integrates natively with Azure identity (Managed Identity), Azure Key Vault (for secrets), and SDKs for major platforms. [docs.azure.cn](https://docs.azure.cn/en-us/azure-app-configuration/)
+
+**Key capabilities we’ll use:**
+
+- Key‑values (with grouping by prefixes and/or labels), dynamic refresh, and Key Vault references. [docs.azure.cn](https://docs.azure.cn/en-us/azure-app-configuration/), [learn.microsoft.com](https://docs.azure.cn/en-us/azure-app-configuration/)
+- Feature flags (switch, gradual rollout, experiment), with first‑class libraries (e.g., .NET FeatureManagement). [learn.microsoft.com](https://learn.microsoft.com/en-us/azure/azure-app-configuration/manage-feature-flags), [learn.microsoft.com](https://learn.microsoft.com/en-us/azure/azure-app-configuration/feature-management-dotnet-reference)
+- Snapshots (immutable sets of key‑values) for controlled rollout and instant rollback, plus snapshot references for switching configs without redeploying. [learn.microsoft.com](https://learn.microsoft.com/en-us/azure/azure-app-configuration/concept-snapshots), [learn.microsoft.com](https://learn.microsoft.com/en-us/azure/azure-app-configuration/concept-snapshot-references)
+
+### Architecture at a Glance
+
+```meraid
+  flowchart LR
+    subgraph Dev Subscription
+      A1[App Config - dev]:::cfg
+    end
+    subgraph Test Subscription
+      A2[App Config - test]:::cfg
+    end
+    subgraph Prod Subscription
+      A3[App Config - prod]:::cfg
+    end
+
+    subgraph CI/CD
+      P1[Pipeline: Promote settings] -->|import/export| A2
+      P1 -->|snapshot create| A3
+    end
+
+    subgraph Runtime
+      Svc1[Web/API App] -->|Managed Identity| A3
+      Svc2[Worker/Functions] -->|Managed Identity| A3
+    end
+
+    classDef cfg fill:#eef,stroke:#36c,stroke-width:1px;
+```
+
+**Pattern**: one App Configuration **store per environment** (dev/test/prod) for **clear security boundaries** and operational blast‑radius isolation; promote via CLI/automation; apps connect to their environment’s store with **Managed Identity** + RBAC. This complements (or replaces) labels, and simplifies RBAC, networking, and auditing. [learn.microsoft.com](https://learn.microsoft.com/en-us/azure/azure-app-configuration/howto-best-practices), [stackoverflow.com](https://stackoverflow.com/questions/76828560/in-which-environment-should-azure-app-configuration-be-placed)
+
+Key Naming & Hierarchy (with **)
+We’ll standardize hierarchical keys using a double underscore (**) separator:
+
+```
+contoso__checkout__api__baseUrl
+contoso__checkout__timeouts__connectMs
+contoso__checkout__featureflags__NewHeader
+```
+
+**.NET nuance:** Inside Azure App Configuration, the canonical hierarchy separator is **`:`** for .NET’s configuration system; **environment variables** use **`__`**, which .NET converts to **`:`** automatically. If you **`store keys with __ inside App Configuration`**, Options binding won’t treat them as hierarchical unless you normalize to **`:`** in your app’s configuration pipeline—so the recommended approach is: **`store : in App Configuration`**, use **`__`** for env‑var overrides. [[9](https://github.com/Azure/AppConfiguration/issues/957)][[10](https://stackoverflow.com/questions/77234673/azure-app-configuration-double-underscore-not-equivalent-to-colon-when-trying-t)]
+
+**Best practice for grouping**: choose a **stable prefix** per app/service (e.g., `contoso:checkout:` or with `__` if you’ll rely on env vars), and optionally trim the prefix at runtime. App Configuration supports key prefixes and labels for grouping/variation; we’ll prefer prefixes + separate stores per environment. [learn.microsoft.com](https://learn.microsoft.com/en-us/azure/azure-app-configuration/howto-best-practices)
+
+### Creating Stores & Baseline Settings
+
+Create one store per environment (names are globally unique):
+
+```shell
+az appconfig create \
+  --name contoso-appconfig-dev \
+  --resource-group rg-contoso-dev \
+  --location westeuropeShow more lines
+```
+
+Repeat for **-test** and **-prod**.  [docs.azure.cn](https://docs.azure.cn/en-us/azure-app-configuration/cli-samples)
+
+Assign your app’s Managed Identity **App Configuration Data Reader** and consider **private endpoints** for production. [[2](https://learn.microsoft.com/en-us/azure/azure-app-configuration/reference-dotnet-provider)][[1](https://docs.azure.cn/en-us/azure-app-configuration/)]
+
+Example seed (dev):
+
+```shell
+az appconfig kv set --name contoso-appconfig-dev \
+  --key "contoso:checkout:api:baseUrl" --value "https://checkout-dev.api.contoso.com"
+az appconfig kv set --name contoso-appconfig-dev \
+  --key "contoso:checkout:timeouts:connectMs" --value "5000"
+```
+
+Use JSON content types when you store structured settings. [github.com](https://github.com/MicrosoftDocs/azure-docs/blob/main/articles/azure-app-configuration/cli-samples.md), [learn.microsoft.com](https://learn.microsoft.com/en-us/azure/azure-app-configuration/howto-best-practices)
+
+### Using Settings from Your App
+
+Install the provider:
+
+```shell
+dotnet add package Microsoft.Extensions.Configuration.AzureAppConfiguration
+dotnet add package Microsoft.Azure.AppConfiguration.AspNetCore
+dotnet add package Azure.Identity
+```
+
+Configure in **Program.cs**:
+
+```C#
+using Azure.Identity;
+using Microsoft.Extensions.Configuration.AzureAppConfiguration;
+
+var builder = WebApplication.CreateBuilder(args);
+
+var endpoint = new Uri(Environment.GetEnvironmentVariable("APPCONFIG_ENDPOINT")!);
+
+builder.Configuration.AddAzureAppConfiguration(options =>
+{
+    options.Connect(endpoint, new DefaultAzureCredential())
+        // Load keys for this app only
+        .Select("contoso:checkout:*")
+        // Optional: also load unlabeled defaults
+        .Select(KeyFilter.Any, LabelFilter.Null)
+        // Enable dynamic refresh for selected keys
+        .ConfigureRefresh(refresh => refresh.RegisterAll());
+    // Enable feature flags (see next section)
+    options.UseFeatureFlags();
+});
+
+builder.Services.AddAzureAppConfiguration();
+builder.Services.AddFeatureManagement(); // feature flags
+
+var app = builder.Build();
+app.UseAzureAppConfiguration(); // needed for dynamic refresh middleware
+app.MapGet("/", (IConfiguration config) => new
+{
+    BaseUrl = config["contoso:checkout:api:baseUrl"],
+    ConnectTimeout = config["contoso:checkout:timeouts:connectMs"]
+});
+app.Run();
+```
+
+This uses **Managed Identity** (via `DefaultAzureCredential`), **key selection**, and **dynamic refresh**. Add **`UseFeatureFlags`** for feature flags.  [learn.microsoft.com](https://learn.microsoft.com/en-us/azure/azure-app-configuration/reference-dotnet-provider), [learn.microsoft.com](https://learn.microsoft.com/en-us/azure/azure-app-configuration/enable-dynamic-configuration-aspnet-core), [docs.azure.cn](https://docs.azure.cn/en-us/azure-app-configuration/quickstart-feature-flag-dotnet-background-service)
+
+Install the client:
+
+```shell
+npm i @azure/app-configuration
+```
+
+Use it:
+
+```C#
+import { AppConfigurationClient } from "@azure/app-configuration";
+const endpoint = process.env.APPCONFIG_ENDPOINT;
+const client = new AppConfigurationClient(endpoint); // Use DefaultAzureCredential in production
+
+const baseUrl = await client.getConfigurationSetting({
+  key: "contoso:checkout:api:baseUrl",
+});
+console.log(baseUrl.value);
+```
+
+Use the library to retrieve settings at runtime; for dynamic behavior, poll or centralize configuration reads.  [docs.azure.cn](https://docs.azure.cn/en-us/azure-app-configuration/)
+
+Install:
+
+```Shell
+pip install azure-appconfiguration
+```
+
+Use:
+
+```Pythonfrom azure.appconfiguration import AzureAppConfigurationClient
+from azure.identity import DefaultAzureCredential
+import os
+
+endpoint = os.environ["APPCONFIG_ENDPOINT"]
+client = AzureAppConfigurationClient(endpoint, DefaultAzureCredential())
+setting = client.get_configuration_setting(key="contoso:checkout:api:baseUrl")
+print(setting.value)
+```
+
+Python SDK supports fetching key‑values and feature flags; you can add your own refresh strategy. [docs.azure.cn]
+
+Prefer **`storing : in App Configuration`** and **`using __ in environment variables`** (Linux/containers) to override the same keys at deploy time; .NET converts `__` → `:` automatically. [[9](https://github.com/Azure/AppConfiguration/issues/957)][[15](https://learn.microsoft.com/en-us/answers/questions/605396/the-code-behavior-of-configuration-has-changed-whe)]
+
+### Feature Flags (Switch, Rollout, Experiment)
+
+Azure App Configuration’s **Feature Manager** lets you create flags in the portal/CLI and evaluate them via SDKs. **Filters** support percentage rollout, targeting, time‑window, etc. [learn.microsoft.com](https://learn.microsoft.com/en-us/azure/azure-app-configuration/manage-feature-flags), [learn.microsoft.com](https://learn.microsoft.com/en-us/azure/azure-app-configuration/feature-management-dotnet-reference)
+
+In the portal, go to **Feature manager → Create**, pick a purpose (Switch/Rollout/Experiment), name it (e.g., `NewHeader`), and configure filters. [[3](https://learn.microsoft.com/en-us/azure/azure-app-configuration/manage-feature-flags)]
+
+Add Feature Management and annotate routes/blocks:
+
+```C#
+using Microsoft.FeatureManagement;
+
+app.MapGet("/header", [FeatureGate("NewHeader")] () => "New header enabled!");
+```
+
+Or evaluate programmatically via **IFeatureManager**.
+
+Enable dynamic refresh in the provider (shown earlier). Changing a flag in App Configuration reflects in the app on refresh cycle. [learn.microsoft.com](https://learn.microsoft.com/en-us/azure/azure-app-configuration/feature-management-dotnet-reference) [learn.microsoft.com](https://learn.microsoft.com/en-us/azure/azure-app-configuration/enable-dynamic-configuration-aspnet-core)
+
+Feature flags can be **labeled** (e.g., `NewHeader` with `Development`, `Production` labels) but in this guide we’ll rely on **separate stores per environment**; each environment has its own flags, isolation, and audit. [[7](https://learn.microsoft.com/en-us/azure/azure-app-configuration/howto-best-practices)]
+
+### Snapshots: Immutable, Auditable, Safe Rollouts
+
+**Snapshots** are **named, immutable subsets** of key‑values selected by filters at creation time, ideal for **last‑known‑good (LKG), controlled rollout**, and **auditing**. Once created, contents never change. [learn.microsoft.com](https://learn.microsoft.com/en-us/azure/azure-app-configuration/concept-snapshots)
+
+#### Typical release pattern
+
+1. Prepare settings/flags in test store; validate.
+2. In prod store, create a snapshot for the new release (release-2026-01-30).
+3. Point apps to the snapshot (direct or via snapshot reference).
+4. If needed, roll back by switching to the prior snapshot. [learn.microsoft.com](https://learn.microsoft.com/en-us/azure/azure-app-configuration/concept-snapshots), [learn.microsoft.com](https://learn.microsoft.com/en-us/azure/azure-app-configuration/howto-create-snapshots)
+
+#### Create & manage snapshots (Azure CLI)
+
+```Shell
+# Create a snapshot for all keys under contoso:checkout:
+az appconfig snapshot create \
+  --name contoso-appconfig-prod \
+  --snapshot-name release-2026-01-30 \
+  --filters key="contoso:checkout:*"
+
+# List snapshots
+az appconfig snapshot list --name contoso-appconfig-prod
+
+# Show a snapshot
+az appconfig snapshot show --name contoso-appconfig-prod --snapshot-name release-2026-01-30
+
+# Archive / recover
+az appconfig snapshot archive --name contoso-appconfig-prod --snapshot-name release-2026-01-15
+az appconfig snapshot recover --name contoso-appconfig-prod --snapshot-name release-2026-01-15
+```
+
+These commands manage snapshot lifecycle in the prod store. [learn.microsoft.com](https://learn.microsoft.com/en-us/cli/azure/appconfig/snapshot?view=azure-cli-latest)
+
+#### Snapshot references (recommended)
+
+A **snapshot reference** is a special key‑value that points to a snapshot by name. Your app **just loads the reference key**; when the reference is updated (e.g., to a new snapshot), the provider refresh **seamlessly switches** the app to the new immutable set—no code change or redeploy. [learn.microsoft.com](https://learn.microsoft.com/en-us/azure/azure-app-configuration/concept-snapshot-references)
+
+- Create a snapshot reference in **Configuration Explorer** → **Create** → **Snapshot reference** (pick a key like **`contoso:checkout:snapshotRef`** and target **release-2026-01-30**).
+- Ensure your app selects the reference key (e.g., **`Select("contoso:checkout:\*")`**) and has **refresh** configured. When you update the reference to **release-2026-02-10**, apps will automatically converge to that snapshot upon refresh. [learn.microsoft.com](https://learn.microsoft.com/en-us/azure/azure-app-configuration/concept-snapshot-references)
+
+You can also **retrieve key‑values from a point in time** (outside snapshots) for investigation/restore scenarios. This is separate from snapshots and can help “time‑travel” specific keys. [[18](https://learn.microsoft.com/en-us/azure/azure-app-configuration/concept-point-time-snapshot)]
+
+### Workflow: One App Configuration Store per Environment (no labels)
+
+**Why**: Clear **security boundaries**, **simpler RBAC**, independent **private endpoints**, and operational isolation (blast radius). **Labels** are powerful, but separate stores often map better to enterprise controls. [learn.microsoft.com](https://learn.microsoft.com/en-us/azure/azure-app-configuration/howto-best-practices), [stackoverflow.com](https://stackoverflow.com/questions/76828560/in-which-environment-should-azure-app-configuration-be-placed)
+
+- `contoso-appconfig-dev`, `contoso-appconfig-test`, `contoso-appconfig-prod`.
+- Lock down **prod** with **Data Reader** to runtime identities only; use **Data Owner** sparingly. [2](https://learn.microsoft.com/en-us/azure/azure-app-configuration/reference-dotnet-provider)
+- Use stable prefixes per app: `contoso:checkout:*` (internal `:`), and plan to override via env vars with `__` where needed.
+- Avoid embedding environment in the key; the **store name** is the environment boundary. [[7](https://learn.microsoft.com/en-us/azure/azure-app-configuration/howto-best-practices)]
+- Export from source, import to target using CLI or pipelines.
+
+```bash
+# Export all checkout keys from test to a file
+az appconfig kv export \
+  --name contoso-appconfig-test \
+  --key "contoso:checkout:*" \
+  --format json --path ./checkout.test.json
+```
+
+#### Import into prod (no label—env boundary is the store)
+
+```shell
+az appconfig kv import 
+--name contoso-appconfig-prod 
+--format json --path ./checkout.test.json
+```
+
+<Steps>
+  <Step>
+    - Create a **snapshot** per release in prod; point a **snapshot reference** at it. [[12](https://github.com/MicrosoftDocs/azure-docs/blob/main/articles/azure-app-configuration/cli-samples.md)][[17](https://learn.microsoft.com/en-us/cli/azure/appconfig/snapshot?view=azure-cli-latest)][[6](https://learn.microsoft.com/en-us/azure/azure-app-configuration/concept-snapshot-references)]
+  </Step>
+  <Step title="Application binding">
+    - Each app uses an env‑specific **endpoint**: `APPCONFIG_ENDPOINT` → dev/test/prod store.
+    - Authenticate via **Managed Identity** and `DefaultAzureCredential`. [[2](https://learn.microsoft.com/en-us/azure/azure-app-configuration/reference-dotnet-provider)]
+  </Step>
+  <Step title="Refresh model">
+    - Configure provider refresh with a suitable interval and register keys (or use `RegisterAll`).
+    - For controlled releases, change only the **snapshot reference** value. [[13](https://learn.microsoft.com/en-us/azure/azure-app-configuration/enable-dynamic-configuration-aspnet-core)][[6](https://learn.microsoft.com/en-us/azure/azure-app-configuration/concept-snapshot-references)]
+  </Step>
+</Steps>
+
+---
+
+### Feature Flags in Depth
+
+**Portal operations**: Create flags (Switch/Rollout/Experiment), add filters for targeting (% rollout, audiences, time windows). [[3](https://learn.microsoft.com/en-us/azure/azure-app-configuration/manage-feature-flags)]
+
+<Tabs>
+  <Tab title=".NET (FeatureManagement)">
+    Install & wire up:
+  
+
+    ```bash
+    dotnet add package Microsoft.FeatureManagement
+    dotnet add package Microsoft.FeatureManagement.AspNetCore
+    ```
+
+    Program.cs:
+
+    ```C#
+    builder.Services.AddFeatureManagement();
+    builder.Configuration.AddAzureAppConfiguration(options =>
+    {
+        options.Connect(new Uri(endpoint), new DefaultAzureCredential())
+              .Select("contoso:checkout:*")
+              .UseFeatureFlags(ff => ff.CacheExpirationInterval = TimeSpan.FromSeconds(30));
+    });
+    ```
+
+    Use attributes or IFeatureManager:
+
+    ```C#
+    using Microsoft.FeatureManagement;
+    using Microsoft.FeatureManagement.Mvc;
+
+    app.MapGet("/v2/header", [FeatureGate("NewHeader")] () => "New header");
+    ```
+
+    Note: Feature flags are backed by App Configuration data and respect refresh intervals.  [learn.microsoft.com], [docs.azure.cn]
+
+    Use `az appconfig feature` to script flag rollout:
+
+    ```Shell
+    # Enable a flag
+    az appconfig feature set --name contoso-appconfig-prod --feature NewHeader --yes
+
+    # Add a percentage filter
+    az appconfig feature filter add \
+      --name contoso-appconfig-prod \
+      --feature NewHeader \
+      --filter-name Microsoft.Percentage \
+      --filter-parameters "Value=25"
+    ```
+
+    (Exact verbs/parameters may vary by CLI version; see az appconfig -h for current syntax.) [docs.azure.cn](https://docs.azure.cn/en-us/azure-app-configuration/cli-samples)
+  </Tab>
+
+  <Tab title="TypeScript">
+    Install & wire up:
+    
+    ```bash
+    # add npm install commands here
+    ```
+
+    ```Typescript
+    // Add Typescript example of integration here
+    ```
+  </Tab>
+</Tabs>
+
+### Handling Secrets
+Don’t store secrets as plain values; instead use **Key Vault references** (e.g., `@Microsoft.KeyVault(SecretUri=...)`) so the provider resolves the secret securely at runtime. [docs.azure.cn](https://docs.azure.cn/en-us/azure-app-configuration/)
+
+### Dynamic Refresh Patterns
+
+- **Request‑driven refresh** in ASP.NET Core (**`app.UseAzureAppConfiguration()`**), with provider `ConfigureRefresh` and a **reasonable interval**.
+- Register a sentinel key or **`RegisterAll()`** for whole‑set refreshes. For push models, integrate with Event Grid/EH (advanced). [learn.microsoft.com](https://learn.microsoft.com/en-us/azure/azure-app-configuration/enable-dynamic-configuration-aspnet-core), [github.com](https://github.com/MicrosoftDocs/azure-docs/blob/main/articles/azure-app-configuration/enable-dynamic-configuration-dotnet-core-push-refresh.md)
+
+### JSON & Structured Settings
+App Configuration supports JSON content types; you can store structured JSON and bind to typed options in .NET. Use **`:`** for nested keys in App Configuration; override with **`__`** at deploy time when using env vars. [learn.microsoft.com](https://learn.microsoft.com/en-us/azure/azure-app-configuration/howto-best-practices)
+
+Putting It All Together (End‑to‑End)
+
+- Developers work against `contoso-appconfig-dev`.
+- Integration tests use `contoso-appconfig-test`.
+- Flags and settings validated with **dynamic refresh**. [[13](https://learn.microsoft.com/en-us/azure/azure-app-configuration/enable-dynamic-configuration-aspnet-core)]
+- Export/import from test → prod for the app’s prefix (`contoso:checkout:*`).
+- In **prod**, create **snapshot** `release-YYYY-MM-DD`. [[12](https://github.com/MicrosoftDocs/azure-docs/blob/main/articles/azure-app-configuration/cli-samples.md)][[17](https://learn.microsoft.com/en-us/cli/azure/appconfig/snapshot?view=azure-cli-latest)]
+- Update `contoso:checkout:snapshotRef` → `release-YYYY-MM-DD`.
+- Apps (with refresh) pick up the new **immutable** set.
+- Rollback? Switch snapshotRef back to the previous snapshot. [[6](https://learn.microsoft.com/en-us/azure/azure-app-configuration/concept-snapshot-references)]
+
+Reference Implementations
+
+- Quickstart (ASP.NET Core): dynamic config, AddAzureAppConfiguration. [[20](https://learn.microsoft.com/en-us/azure/azure-app-configuration/quickstart-aspnet-core-app)]
+- .NET provider reference & samples: selection, refresh, identity. [[2](https://learn.microsoft.com/en-us/azure/azure-app-configuration/reference-dotnet-provider)][[21](https://github.com/Azure/AppConfiguration/tree/main/examples)]
+- Manage feature flags in App Configuration (UI/flow). [[3](https://learn.microsoft.com/en-us/azure/azure-app-configuration/manage-feature-flags)]
+- .NET FeatureManagement reference (attributes, filters). [[4](https://learn.microsoft.com/en-us/azure/azure-app-configuration/feature-management-dotnet-reference)]
+- Concept (immutability, scenarios). [[5](https://learn.microsoft.com/en-us/azure/azure-app-configuration/concept-snapshots)]
+- How‑to (create, archive, recover). [[16](https://learn.microsoft.com/en-us/azure/azure-app-configuration/howto-create-snapshots)]
+- Snapshot **references** (switch without redeploy). [[6](https://learn.microsoft.com/en-us/azure/azure-app-configuration/concept-snapshot-references)]
+- CLI commands (create/show/list/archive/recover). [[17](https://learn.microsoft.com/en-us/cli/azure/appconfig/snapshot?view=azure-cli-latest)]
+- Key prefixes vs labels; configuration stacking. [[7](https://learn.microsoft.com/en-us/azure/azure-app-configuration/howto-best-practices)]
+- Env boundary considerations (separate stores). [[8](https://stackoverflow.com/questions/76828560/in-which-environment-should-azure-app-configuration-be-placed)]
+- MDX components (Tabs, Steps, Callouts, Cards, Mermaid). [[22](https://www.mintlify.com/docs/components)]
+
+### Common Gotchas & Opinions
+
+- **`__` vs `:`**: Use `:` inside App Configuration for .NET; use `__` only in env vars (auto‑converted to `:`). If you must store **`__`** in App Configuration, plan a normalization step; otherwise hierarchical binding may fail. [github.com](https://github.com/Azure/AppConfiguration/issues/957), [stackoverflow.com](https://stackoverflow.com/questions/77234673/azure-app-configuration-double-underscore-not-equivalent-to-colon-when-trying-t) 
+- **Overusing labels**: Labels are great, but at scale **separate stores per environment** simplify governance/RBAC and incident response. [learn.microsoft.com](https://learn.microsoft.com/en-us/azure/azure-app-configuration/howto-best-practices), [stackoverflow.com](https://stackoverflow.com/questions/76828560/in-which-environment-should-azure-app-configuration-be-placed) 
+- **Refresh frequency**: Don’t set overly aggressive refresh intervals in high‑QPS services; tune for traffic and SLA. (Provider defaults and patterns are documented.) [learn.microsoft.com](https://learn.microsoft.com/en-us/azure/azure-app-configuration/enable-dynamic-configuration-aspnet-core)
+- Use snapshots for releases: Think of snapshots as config versions; pair them with release artifacts. Prefer **snapshot references** to avoid redeploy. [learn.microsoft.com](https://learn.microsoft.com/en-us/azure/azure-app-configuration/concept-snapshots), [learn.microsoft.com](https://learn.microsoft.com/en-us/azure/azure-app-configuration/concept-snapshot-references)
+
+### Bonus: React Components for Mintlify
+
+Below are small MDX components you can reuse across your docs.
+
+```jsx
+export const EnvCard = ({ name, endpoint }) => (
+  <div className="rounded-lg border p-4 bg-white">
+    <h4 className="text-base font-semibold">{name}</h4>
+    <code className="block mt-1 text-sm">{endpoint}</code>
+  </div>
+);
+
+<Grid cols={3}>
+  <EnvCard name="Dev Store" endpoint="https://contoso-appconfig-dev.azconfig.io" />
+  <EnvCard name="Test Store" endpoint="https://contoso-appconfig-test.azconfig.io" />
+  <EnvCard name="Prod Store" endpoint="https://contoso-appconfig-prod.azconfig.io" />
+</Grid>
+```
+
+Mintlify supports inline React and a library of structured components (Tabs, Steps, Callouts, Cards, Mermaid). [mintlify.com](https://www.mintlify.com/docs/components)
+
+### Appendix
+
+#### CLI cheat‑sheet
+
+```Shell
+# Create store
+az appconfig create --name <store> --resource-group <rg> --location <region>
+
+# Set key
+az appconfig kv set --name <store> --key "contoso:checkout:api:baseUrl" --value "https://..."
+
+# Export/Import for promotion
+az appconfig kv export --name <source> --key "contoso:checkout:*" --format json --path ./out.json
+az appconfig kv import --name <target> --format json --path ./out.json
+
+# Feature flags (basic enable)
+az appconfig feature set --name <store> --feature NewHeader --yes
+
+# Snapshots
+az appconfig snapshot create --name <store> --snapshot-name release-2026-01-30 --filters key="contoso:checkout:*"
+az appconfig snapshot list --name <store>
+az appconfig snapshot show --name <store> --snapshot-name release-2026-01-30
+az appconfig snapshot archive --name <store> --snapshot-name old-release
+az appconfig snapshot recover --name <store> --snapshot-name old-release
+```
+
+See the official Azure CLI reference for all options and examples. [learn.microsoft.com](https://learn.microsoft.com/en-us/cli/azure/appconfig/snapshot?view=azure-cli-latest), [docs.azure.cn](https://docs.azure.cn/en-us/azure-app-configuration/cli-samples) 
+
+### .NET SDK quick links
+
+- **Azure.Data.AppConfiguration** (data plane): point‑in‑time reads, key‑value management. [learn.microsoft.com](https://learn.microsoft.com/en-us/dotnet/api/overview/azure/data.appconfiguration-readme?view=azure-dotnet), [github.com](https://github.com/Azure/azure-sdk-for-net/blob/main/sdk/appconfiguration/Azure.Data.AppConfiguration/README.md?plain=1) 
+- **Microsoft.Extensions.Configuration.AzureAppConfiguration** (.NET provider): selection, refresh, feature flags, Key Vault. [learn.microsoft.com](https://learn.microsoft.com/en-us/azure/azure-app-configuration/reference-dotnet-provider)
+
+### Final Checklist (Copy/Paste)
+
+- Create **dev/test/prod** stores; set RBAC and private network for prod. [learn.microsoft.com](https://learn.microsoft.com/en-us/azure/azure-app-configuration/reference-dotnet-provider) 
+- Adopt prefix conventions (e.g., **contoso:checkout:\***); store **`:`** in App Configuration; use **`__`** only in env vars. [learn.microsoft.com](https://learn.microsoft.com/en-us/azure/azure-app-configuration/howto-best-practices), [github.com](https://github.com/Azure/AppConfiguration/issues/957)
+- Integrate the provider in your app; **select** only your app’s keys; enable **refresh** and **feature flags**. [learn.microsoft.com](https://learn.microsoft.com/en-us/azure/azure-app-configuration/reference-dotnet-provider), [learn.microsoft.com](https://learn.microsoft.com/en-us/azure/azure-app-configuration/enable-dynamic-configuration-aspnet-core)
+- Promote via **export/import**; create **snapshots** in prod; use a **snapshot reference** to go live and roll back quickly. [github.com](https://github.com/MicrosoftDocs/azure-docs/blob/main/articles/azure-app-configuration/cli-samples.md), [learn.microsoft.com](https://learn.microsoft.com/en-us/cli/azure/appconfig/snapshot?view=azure-cli-latest), [learn.microsoft.com](https://learn.microsoft.com/en-us/azure/azure-app-configuration/concept-snapshot-references)
+- Store secrets as **Key Vault references**; never plain text. [docs.azure.cn](https://docs.azure.cn/en-us/azure-app-configuration/)
+ 
